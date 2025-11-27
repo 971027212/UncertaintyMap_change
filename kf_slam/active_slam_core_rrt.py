@@ -4,6 +4,9 @@ This code is the core of active slam algorithm for rrt planning. It is a ROS nod
 
 """
 
+import argparse
+import csv
+import os
 import rospy
 from std_msgs.msg import Float64 as debug
 from std_msgs.msg import Float32 as divergence
@@ -23,6 +26,7 @@ from copy import deepcopy as copy
 from simulated_2d_slam2_test import Simulator_manager
 from nav_msgs.msg  import Path
 from uncertainty_frointier import UFrontier
+from msf_rrt import MSF_RRT
 
 from scipy.ndimage import distance_transform_edt # implementa la SDF sobre un mapa de ocupacion.
 
@@ -56,6 +60,48 @@ def get_states()->Main_data:
     obstacle_map=gt_data.obstacle_map.map_.T
     del gt_data
     return md# pose_agent[0]=x,pose_agent[1]=y
+
+def compute_path_length(path: Path) -> float:
+    if path is None:
+        return 0.0
+    distance=0.0
+    if len(path.poses)==0:
+        return distance
+    prev=np.array([path.poses[0].pose.position.x,path.poses[0].pose.position.y])
+    for pose in path.poses[1:]:
+        curr=np.array([pose.pose.position.x,pose.pose.position.y])
+        distance+=np.linalg.norm(curr-prev)
+        prev=curr
+    return distance
+
+def compute_coverage(exp_map: np.ndarray) -> float:
+    if exp_map is None or exp_map.size==0:
+        return 0.0
+    beta=rospy.get_param('sigma_max',1.0)
+    return float(np.mean(exp_map<beta))
+
+def compute_uncertainty(exp_map: np.ndarray) -> float:
+    if exp_map is None or exp_map.size==0:
+        return 0.0
+    return float(np.mean(exp_map))
+
+def parse_cli_args():
+    parser=argparse.ArgumentParser(description='Active SLAM core with selectable planner')
+    parser.add_argument('--planner_type',choices=['baseline','msf_rrt'],default='baseline')
+    parser.add_argument('--result_path',default=None,help='CSV file to store run metrics')
+    args,_=parser.parse_known_args(rospy.myargv()[1:])
+    return args
+
+def init_result_writer(path):
+    if not path:
+        return None,None
+    directory=os.path.dirname(path)
+    if directory:
+        os.makedirs(directory,exist_ok=True)
+    handler=open(path,'w',newline='')
+    writer=csv.writer(handler)
+    writer.writerow(['step','coverage','distance','uncertainty','siren'])
+    return handler,writer
 
 def get_frontiers(self,u_map=np.array([]),obstacle_map=np.array([]),show_animation=False):
     # Get frontiers from the map and return senters and a flag that indicates if there are frontiers or not
@@ -132,34 +178,33 @@ def divergence_prediction():
     global current_divergence
 
 
-def process_(show_animation=False)->(Path,float):
+def process_(planner_type="baseline", msf_params=None, show_animation=False)->(Path,float,Main_data):
     global current_divergence,marker_array
     minimun_distance=rospy.get_param('min_obstacle_distance_sdf')
     max_iter_=rospy.get_param('max_iter_rrt')
-    rrt=RRT_star_ROS(show_animation=False,minimun_distance=minimun_distance,max_iter=max_iter_)
-    # obtiene la posicion actual del robot
+    if planner_type=="msf_rrt":
+        params=msf_params or {}
+        rrt=MSF_RRT(show_animation=False,minimun_distance=minimun_distance,max_iter=max_iter_,**params)
+    else:
+        rrt=RRT_star_ROS(show_animation=False,minimun_distance=minimun_distance,max_iter=max_iter_)
     md=get_states()
-    #import pdb; pdb.set_trace()
     rrt.robot_pose.x=md.states[0:2][0]
     rrt.robot_pose.y=md.states[0:2][1]
     P=md.P ;    D=np.array([[P[0][0],P[0][1]],[P[1][0],P[1][1]]])
     sigma_robot=np.power(np.linalg.det(D),0.25)
-    rrt.robot_pose.z=sigma_robot # temperatura del robot
+    rrt.robot_pose.z=sigma_robot
     rrt.obstacle_map=md.obstacle_map
-    # procesa los landmarks para la planificacion.
     rrt.landmarks.landmarks_poses=md.states[2:]
     rrt.landmarks.P=md.P
     rrt.process_landmark()
 
     goals=[]
-    #goals.extend(landmarks_objetive(md)) # TODO, se planifica sin tener en cuenta los landmarks
     modified_obstacle_map=prepare_obstacle_map(md)
-    # p_objetive,distance,flag=get_frontiers(md,obstacle_map=modified_obstacle_map.T,u_map=md.exp_map)
     centers,flag=get_frontiers(md,obstacle_map=modified_obstacle_map.T,u_map=md.exp_map,show_animation=show_animation)
     if not flag:
-        print('A goal was not found.') # No se encontro un objetivo
-        return None,None
-    
+        print('A goal was not found.')
+        return None,None,md
+
     for c in centers:
         goals.append([c[0],c[1]])
 
@@ -168,10 +213,10 @@ def process_(show_animation=False)->(Path,float):
 
     first_time=True
     divergences=[]
-    divergences_=[] # for predicted divergence
+    divergences_=[]
     paths=[]
     dmin=None
-    for g in goals:        
+    for g in goals:
         rrt.goal_pose.x=g[0]
         rrt.goal_pose.y=g[1]
         if first_time:
@@ -179,24 +224,18 @@ def process_(show_animation=False)->(Path,float):
             rrt.run_first_time()
         else:
             rrt.run_hot()
-        # Path obtenido, TODO: revisar si el path es valido $1
-        #import pdb; pdb.set_trace()
         if rrt.path is not None:
             path=[]
             d=0
             pose_anterior=np.array([rrt.robot_pose.x,rrt.robot_pose.y])
-            for p in rrt.path.poses: # calcula la distancia recorrida
+            for p in rrt.path.poses:
                 path.append((p.pose.position.x,p.pose.position.y))
                 d=d+np.linalg.norm(np.array([p.pose.position.x,p.pose.position.y])-pose_anterior)
                 pose_anterior=np.array([p.pose.position.x,p.pose.position.y])
-            #path=copy(rrt.path.poses)
-            # TODO: Obtener la distancia para descartar path mas largos que dmax
             dmax=20.0
-            dmax_=100 # test para el galpon
+            dmax_=100
 
-
-            # ############ $1 TODO OJO ACA
-            if dmin is None or d<dmin: # $1 ojo aca!! frontera mas cercana unicamente, sin simular
+            if dmin is None or d<dmin:
                 dmin=d
                 if len(divergences)==0:
                     divergences.append(1)
@@ -205,13 +244,9 @@ def process_(show_animation=False)->(Path,float):
 
             else:
                 divergences.append(0)
-                pass
-
             paths.append(rrt.path)
             divergences_.append(0)
-
             continue
-            # ############ $1 TODO OJO ACA  
 
             if d>dmax+dmax_:
                 rospy.logwarn('Distancia de trayectoria mayor a '+str(dmax)+' m')
@@ -220,60 +255,48 @@ def process_(show_animation=False)->(Path,float):
                 divergences_.append(0)
                 continue
 
-            time.sleep(1) # si no pones esto se cuelga
+            time.sleep(1)
             sim=Simulator_manager(ros_required=False)
             sim.states=md.states
             sim.P=md.P
             sim.exp_map=md.exp_map
-            sim.obstacle_map=md.obstacle_map.T # ??? tranpuesto o no?
+            sim.obstacle_map=md.obstacle_map.T
             sim.path=path
-            # hacer las alucinaciones
-            #import pdb; pdb.set_trace()
             diver,distance=sim.run()
-            print('Point: ',f'({g[0]:.3f},{g[1]:.3f})','Divergence: ',f'{diver:.3f}',' Distance: ',f'{distance:.3f}')            
+            print('Point: ',f'({g[0]:.3f},{g[1]:.3f})','Divergence: ',f'{diver:.3f}',' Distance: ',f'{distance:.3f}')
+
             del sim
-            if distance<2.0: # Para evitar que no se mueva.
-                divergences.append(0)                
+            if distance<2.0:
+                divergences.append(0)
                 paths.append([])
             else:
 
                 paths.append(rrt.path)
-                
+
                 if distance<dmax+dmax_:
-                    #divergences.append((diver-current_divergence)*(1-distance/dmax))# ponderacion de la distancia
-                    divergences.append((diver-current_divergence)*(np.power(np.math.e,-distance/dmax)))# ponderacion de la distancia
+                    divergences.append((diver-current_divergence)*(np.power(np.math.e,-distance/dmax)))
                 else:
-                    rospy.logwarn('Distancia de trayectoria mayor a '+str(dmax)+' m')                    
-                    #divergences.append(0) # a lo obtenido por fronteras no esta ponderado por la distancia
-                #if g==goals[-1]:
-                #    divergences.append(diver-current_divergence) # a lo obtenido por fronteras no esta ponderado por la distancia
-                #    
-                #else:
-                #    divergences.append((diver-current_divergence)*(1-distance/20.0))# ponderacion de la distancia
-                
+                    rospy.logwarn('Distancia de trayectoria mayor a '+str(dmax)+' m')
             divergences_.append(diver)
-                #divergences.append(diver)
-                #print('paso 1')
         else:
             print('A path was not found.')
             divergences.append(0)
             divergences_.append(0)
             paths.append([])
-            
+
     max_value = max(divergences)
     print('rewards: ',np.array(divergences).round(3))
 
     if max_value==0:
         print('RRT did not find any viable path, recalculating.')
-        return -1,None
+        return -1,None,md
     max_index = divergences.index(max_value)
-    
+
     clear_all_markers(marker_array,frame_id="robot1_tf/odom_groundtruth")
     marker_data=create_border_marker(centers,frame_id="robot1_tf/odom_groundtruth",id=max_index,radius=0.5)
     marker_array.publish(marker_data)
-    #print("El maximo valor de divergencia es: ",f'{max_value:.3f}', " y se encuentra en el goal: ",np.array(goals[max_index]).round(3))
 
-    return paths[max_index],divergences_[max_index]
+    return paths[max_index],divergences_[max_index],md
 
 def move_robot_safe():
     global current_divergence
@@ -307,9 +330,14 @@ def move_robot_safe():
     
 def principal():
     global path_ready_flag, current_divergence,marker_array
+    args=parse_cli_args()
+    msf_params=rospy.get_param('msf_rrt',{}) if args.planner_type=='msf_rrt' else {}
+    result_handle,result_writer=init_result_writer(args.result_path)
+    cumulative_distance=0.0
+    step_counter=0
     rospy.init_node('active_slam',anonymous=True)
     pub_rrt_path=rospy.Publisher('/path_rrt_star',Path,queue_size=1)
-    
+
     path_ready=rospy.Subscriber('/path_ready',Bool,callback=path_callback,queue_size=1)
     divergence_reading=rospy.Subscriber('/divergence',divergence,callback=divergence_callback,queue_size=1)
     marker_array = rospy.Publisher('border_markers', MarkerArray, queue_size=10)
@@ -317,40 +345,39 @@ def principal():
     predicted_diver=None
     recompute_flag=0
 
-    while not rospy.is_shutdown():
-        if path_ready_flag or recompute_flag>0:   
-            if predicted_diver is not None:
-                print('##PREDICTED DIVERGENCE VS CURRENT DIVERGENCE: ',round(current_divergence-predicted_diver,3),'Current: ',round(current_divergence,3),'Predicted: ',round(predicted_diver,3))
-            path,predicted_diver=process_()
-            if path is None:
-                #print('No se encontro un path')
-                rospy.signal_shutdown('Task successfully completed.')
-                return
-            elif path==-1:
-               rospy.logwarn('A valid path is not found. It is necessary to move the vehicle to find a valid path.')
-               # disminuir a cero la exclusion
-               # calcular un path cercano a un lugar libre
-               # ejecutar ese path
-               # poner la exlusion como estaba antes
-               #path,predicted_diver=process_(show_animation=True)
-               #plt.plot(1,1,'xr')
-               #plt.show()
-               
-               #move_robot_safe()
-               #return
-               if recompute_flag>10:
-                   rospy.logerr('A valid path was searched for 10 times and not found. It is necessary to move the vehicle to find a valid path. The simulation will close: ERROR path not found.')
-                   #plt.plot(1,1,'xr')
-                   #plt.show()
-                   return
-               recompute_flag+=1
-            else:
-                #print('Se encontro un path')
-                pub_rrt_path.publish(path)
-                recompute_flag=0
-            
-            path_ready_flag=False
-        rate.sleep()
-                
+    try:
+        while not rospy.is_shutdown():
+            if path_ready_flag or recompute_flag>0:
+                if predicted_diver is not None:
+                    print('##PREDICTED DIVERGENCE VS CURRENT DIVERGENCE: ',round(current_divergence-predicted_diver,3),'Current: ',round(current_divergence,3),'Predicted: ',round(predicted_diver,3))
+                path,predicted_diver,md=process_(planner_type=args.planner_type,msf_params=msf_params)
+                if path is None:
+                    rospy.signal_shutdown('Task successfully completed.')
+                    return
+                elif path==-1:
+                   rospy.logwarn('A valid path is not found. It is necessary to move the vehicle to find a valid path.')
+                   if recompute_flag>10:
+                       rospy.logerr('A valid path was searched for 10 times and not found. It is necessary to move the vehicle to find a valid path. The simulation will close: ERROR path not found.')
+                       return
+                   recompute_flag+=1
+                else:
+                    pub_rrt_path.publish(path)
+                    coverage=compute_coverage(md.exp_map)
+                    step_distance=compute_path_length(path)
+                    cumulative_distance+=step_distance
+                    uncertainty=compute_uncertainty(md.exp_map)
+                    siren_score=rospy.get_param('siren_score',None)
+                    if result_writer:
+                        result_writer.writerow([step_counter,coverage,cumulative_distance,uncertainty,'' if siren_score is None else siren_score])
+                        result_handle.flush()
+                    step_counter+=1
+                    recompute_flag=0
+
+                path_ready_flag=False
+            rate.sleep()
+    finally:
+        if result_handle:
+            result_handle.close()
+
 if __name__=='__main__':
     principal()

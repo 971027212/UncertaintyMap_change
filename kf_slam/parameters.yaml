@@ -26,3 +26,10 @@ map: galpon_1   # nombre del mapa o direccion del mapa.
 
 
 map_agent: true # incorpora la incertidumbre del agente en el mapa de landmarks, es experimental.
+
+msf_rrt:
+  bias_ratio: 0.3
+  step_size_min: 0.3
+  step_size_max: 0.8
+  obstacle_threshold: 0.5
+  smoothing: true
