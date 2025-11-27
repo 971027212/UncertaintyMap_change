@@ -35,6 +35,7 @@ from frontiers_markers import create_border_marker,clear_all_markers
 
 path_ready_flag=False
 current_divergence=0.0
+initial_mean_uncertainty = None
 
 class Main_data:
     def __init__(self):
@@ -75,10 +76,33 @@ def compute_path_length(path: Path) -> float:
     return distance
 
 def compute_coverage(exp_map: np.ndarray) -> float:
-    if exp_map is None or exp_map.size==0:
+    """基于“相对初始不确定性”的覆盖率：
+       第一次调用时记录初始平均不确定性，此时覆盖率记为 0；
+       之后 coverage = 1 - mean_uncertainty / initial_mean_uncertainty。
+    """
+    global initial_mean_uncertainty
+
+    if exp_map is None or exp_map.size == 0:
         return 0.0
-    beta=rospy.get_param('sigma_max',1.0)
-    return float(np.mean(exp_map<beta))
+
+    mean_uncertainty = float(np.mean(exp_map))
+
+    # 第一次调用：记录初始均值，并返回 0（表示一开始覆盖率=0）
+    if initial_mean_uncertainty is None:
+        initial_mean_uncertainty = mean_uncertainty
+        return 0.0
+
+    # 避免除以 0
+    if initial_mean_uncertainty <= 1e-9:
+        return 1.0
+
+    # 覆盖率 = 初始均值下降了多少比例
+    coverage = 1.0 - (mean_uncertainty / initial_mean_uncertainty)
+
+    # 数值上做个保险截断
+    return float(np.clip(coverage, 0.0, 1.0))
+
+
 
 def compute_uncertainty(exp_map: np.ndarray) -> float:
     if exp_map is None or exp_map.size==0:
@@ -331,11 +355,12 @@ def move_robot_safe():
 def principal():
     global path_ready_flag, current_divergence,marker_array
     args=parse_cli_args()
+    rospy.init_node('active_slam',anonymous=True)
     msf_params=rospy.get_param('msf_rrt',{}) if args.planner_type=='msf_rrt' else {}
     result_handle,result_writer=init_result_writer(args.result_path)
     cumulative_distance=0.0
     step_counter=0
-    rospy.init_node('active_slam',anonymous=True)
+
     pub_rrt_path=rospy.Publisher('/path_rrt_star',Path,queue_size=1)
 
     path_ready=rospy.Subscriber('/path_ready',Bool,callback=path_callback,queue_size=1)
